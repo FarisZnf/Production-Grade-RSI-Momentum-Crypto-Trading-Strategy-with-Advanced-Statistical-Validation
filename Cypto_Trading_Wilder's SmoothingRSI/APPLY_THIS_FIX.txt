@@ -1,0 +1,172 @@
+================================================================================
+INSTRUCTIONS TO FIX ROBUSTNESS ANALYZER BUGS (v5.2)
+================================================================================
+
+The Monte Carlo permutation test is broken because it adds tiny noise (0.001)
+instead of doing TRUE permutation. This causes impossible Std Dev = 0.01% and
+extreme Z-scores (±500 to ±4000).
+
+FIX REQUIRED:
+Replace the run_monte_carlo_permutation_test method in RobustnessAnalyzer class.
+
+LOCATION: rsi_momentum_backtest_v5.py, lines ~1306-1380
+
+CURRENT (BROKEN) CODE:
+```python
+def run_monte_carlo_permutation_test(self, symbol: str, num_simulations: int = 1000) -> Dict:
+    # ... (lines 1306-1330 same)
+    
+    # Get trade returns (ROI %)
+    trade_returns = backtest.trades['net_pnl'] / (backtest.trades['entry_price'] * backtest.trades['position_size']) * 100
+    trade_returns = trade_returns.values
+    
+    # ... (lines 1335-1345 same)
+    
+    for i in range(num_simulations):
+        if (i + 1) % 200 == 0:
+            print(f"[INFO] Simulation {i + 1}/{num_simulations}...")
+        
+        # Add Gaussian noise to each trade return (N(0, 0.001))  <-- THIS IS THE BUG
+        noise = np.random.normal(0, 0.001, n_trades)
+        perturbed_returns = trade_returns + noise
+        
+        # Calculate cumulative equity curve
+        equity = 1000.0
+        for ret in perturbed_returns:
+            equity *= (1 + ret / 100)
+        
+        final_returns[i] = (equity / 1000.0 - 1) * 100
+```
+
+REPLACE WITH (FIXED CODE):
+```python
+def run_monte_carlo_permutation_test(self, symbol: str, num_simulations: int = 1000) -> Dict:
+    """
+    Monte Carlo Permutation Test - FIXED.
+    
+    FIX: TRUE permutation of trade P&L values (not tiny noise).
+    For each simulation:
+    1. Extract actual trade net_pnl values from production backtest
+    2. Randomly SHUFFLE the order of trades
+    3. Rebuild equity curve from shuffled sequence
+    4. Record final return
+    
+    This tests whether the SEQUENCE of trades matters (luck) or if
+    the strategy has genuine edge regardless of trade order.
+    """
+    print(f"\n{'='*70}")
+    print(f"MONTE CARLO PERMUTATION TEST (FIXED) - {symbol}")
+    print(f"{'='*70}")
+    print(f"[INFO] Running {num_simulations} TRUE permutations...")
+    
+    # Run production backtest to get actual trades
+    df = self.data_engine.fetch_symbol_data(symbol, self.config.TIMEFRAME)
+    df = SignalGenerator(self.config).generate_signals(df)
+    backtest = BacktestEngine(self.config)
+    df = backtest.run_backtest(df, symbol)
+    
+    if backtest.trades.empty or len(backtest.trades) < 10:
+        print(f"[WARNING] Insufficient trades for Monte Carlo test")
+        return {'error': 'Insufficient trades'}
+    
+    # Extract ACTUAL trade P&L values (NOT ROI %, just P&L)
+    trade_pnl = backtest.trades['net_pnl'].values
+    n_trades = len(trade_pnl)
+    
+    print(f"[INFO] Found {n_trades} trades for permutation")
+    print(f"[INFO] Actual Total Net P&L: ${trade_pnl.sum():.2f}")
+    
+    # Run TRUE permutations
+    np.random.seed(42)
+    final_returns = np.zeros(num_simulations)
+    
+    for i in range(num_simulations):
+        if (i + 1) % 200 == 0:
+            print(f"[INFO] Simulation {i + 1}/{num_simulations}...")
+        
+        # TRUE permutation: shuffle the ORDER of trades
+        shuffled_pnl = np.random.permutation(trade_pnl)
+        
+        # Rebuild equity curve from shuffled trades
+        # Start with initial capital, ADD each trade P&L sequentially
+        equity = 1000.0
+        for pnl in shuffled_pnl:
+            equity += pnl  # ADD P&L (not multiply by return)
+        
+        final_returns[i] = (equity / 1000.0 - 1) * 100
+    
+    actual_return = backtest.calculate_metrics(df['equity'])['total_return'] * 100
+    
+    # Calculate statistics
+    results = {
+        'symbol': symbol,
+        'num_simulations': num_simulations,
+        'num_trades': n_trades,
+        'actual_return_pct': actual_return,
+        'actual_total_pnl': trade_pnl.sum(),
+        'mean_final_return': final_returns.mean(),
+        'median_final_return': np.median(final_returns),
+        'std_final_return': final_returns.std(),
+        'min_final_return': final_returns.min(),
+        'max_final_return': final_returns.max(),
+        'percentile_5th': np.percentile(final_returns, 5),
+        'percentile_25th': np.percentile(final_returns, 25),
+        'percentile_75th': np.percentile(final_returns, 75),
+        'percentile_95th': np.percentile(final_returns, 95),
+        'percent_profitable_sims': (final_returns > 0).sum() / num_simulations * 100,
+        'actual_percentile': (final_returns < actual_return).sum() / num_simulations * 100,
+        'z_score': (actual_return - final_returns.mean()) / final_returns.std() if final_returns.std() > 0 else 0,
+        'final_returns_array': final_returns
+    }
+    
+    self._print_monte_carlo_summary(results)
+    return results
+```
+
+================================================================================
+QUICK TEST AFTER APPLYING FIX:
+================================================================================
+
+Run this command to test if the fix works:
+
+```bash
+python -c "
+from rsi_momentum_backtest_v5 import *
+config = StrategyConfig()
+analyzer = RobustnessAnalyzer(config)
+mc_results = analyzer.run_monte_carlo_permutation_test('BNBUSDT', num_simulations=100)
+print(f'Std Dev: {mc_results[\"std_final_return\"]:.2f}%')
+print(f'Z-Score: {mc_results[\"z_score\"]:.2f}')
+print(f'Actual Percentile: {mc_results[\"actual_percentile\"]:.1f}%')
+"
+```
+
+EXPECTED OUTPUT (after fix):
+- Std Dev: 5-15% (NOT 0.01%)
+- Z-Score: -3 to +3 (NOT ±500 to ±4000)
+- Actual Percentile: meaningful value between 0-100%
+
+================================================================================
+WHY THE OLD CODE WAS BROKEN:
+================================================================================
+
+1. trade_returns = net_pnl / (entry_price * position_size) * 100
+   This converts P&L to ROI %, which for large positions is tiny (< 1%)
+
+2. noise = np.random.normal(0, 0.001, n_trades)
+   Adding N(0, 0.001) noise to values that are already < 1% means the noise
+   is larger than the signal!
+
+3. equity *= (1 + ret / 100)
+   Multiplying by (1 + tiny_return) for each trade means all simulations
+   converge to nearly the same value → Std Dev ≈ 0
+
+4. With Std Dev ≈ 0, Z-score = (actual - mean) / 0.0001 → ±1000s
+
+THE FIX:
+1. Use trade_pnl directly (dollar values, not %)
+2. np.random.permutation(trade_pnl) - TRUE shuffle
+3. equity += pnl - ADD dollar P&L (compound properly)
+4. Now Std Dev reflects actual trade sequence variance
+
+================================================================================

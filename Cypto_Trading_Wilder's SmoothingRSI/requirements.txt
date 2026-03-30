@@ -1,0 +1,22 @@
+# RSI Momentum Backtest Dependencies
+# ====================================
+
+# Core data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Portfolio performance metrics
+ffn>=0.3.7
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Binance API client
+python-binance>=1.0.19
+
+# Excel export (for trade logs)
+xlsxwriter>=3.0.0
+
+# Additional utilities
+requests>=2.31.0
